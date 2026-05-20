@@ -1,4 +1,4 @@
-# Paul Graham Essay AI Chatbot (Premium Dark Enterprise Edition)
+# Paul Graham Essay AI 
 
 A high-performance, high-fidelity Retrieval-Augmented Generation (RAG) chatbot designed to answer inquiries grounded exclusively in the writings and essays of Paul Graham. 
 
