@@ -10,9 +10,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "pg_essays.db"
 
 # Model configuration
-EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_MODEL = "gemini-embedding-2"
 LLM_MODEL = "gemini-3.1-flash-lite"
-EMBEDDING_DIMENSION = 3072
+EMBEDDING_DIMENSION = 768
 
 # Scraping & Chunking configuration
 SCRAPE_INDEX_URL = "https://paulgraham.com/articles.html"

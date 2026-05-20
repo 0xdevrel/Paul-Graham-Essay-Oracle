@@ -3,60 +3,97 @@ import json
 import logging
 import time
 from google import genai
-from app.config import EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP, get_api_key
+from app.config import EMBEDDING_MODEL, EMBEDDING_DIMENSION, CHUNK_SIZE, CHUNK_OVERLAP, get_api_key
 from app.database import get_db_connection, set_ingestion_state
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("embedder")
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """Splits raw essay text into semantic overlapping passages.
-    
-    Tries to split by paragraph first. If a paragraph is too large, 
-    splits it into sentences, preserving context across boundaries.
+    """Splits raw essay text into semantic overlapping passages aligned perfectly
+    on complete sentence boundaries. Prevents sentence-slicing.
     """
     paragraphs = text.split("\n\n")
-    chunks = []
-    current_chunk = ""
+    sentences = []
     
     for para in paragraphs:
         para = para.strip()
         if not para:
             continue
+        
+        # Split paragraph into sentences
+        raw_sentences = re.split(r'(?<=[.!?])\s+', para)
+        for s in raw_sentences:
+            s = s.strip()
+            if not s:
+                continue
             
-        # If the paragraph is larger than chunk_size, split by sentence
-        if len(para) > chunk_size:
-            sentences = re.split(r'(?<=[.!?])\s+', para)
-            for sentence in sentences:
-                sentence = sentence.strip()
-                if not sentence:
-                    continue
-                # If adding this sentence doesn't exceed the chunk size, add it
-                if len(current_chunk) + len(sentence) + 1 <= chunk_size:
-                    current_chunk += (" " if current_chunk else "") + sentence
-                else:
-                    if current_chunk:
-                        chunks.append(current_chunk)
-                    # Initialize next chunk with overlap from the previous one
-                    overlap_start = max(0, len(current_chunk) - overlap)
-                    overlap_text = current_chunk[overlap_start:]
-                    current_chunk = overlap_text + (" " if overlap_text else "") + sentence
-        else:
-            # If paragraph fits into current chunk, append it
-            if len(current_chunk) + len(para) + 2 <= chunk_size:
-                current_chunk += ("\n\n" if current_chunk else "") + para
+            # If a single sentence exceeds the chunk_size, split it at word boundaries
+            if len(s) > chunk_size:
+                words = s.split(" ")
+                current_part = ""
+                for w in words:
+                    if len(current_part) + len(w) + 1 <= chunk_size:
+                        current_part += (" " if current_part else "") + w
+                    else:
+                        if current_part:
+                            sentences.append(current_part)
+                        current_part = w
+                if current_part:
+                    sentences.append(current_part)
             else:
-                if current_chunk:
-                    chunks.append(current_chunk)
-                # Initialize next chunk with overlap
-                overlap_start = max(0, len(current_chunk) - overlap)
-                overlap_text = current_chunk[overlap_start:]
-                if len(overlap_text) > overlap:
-                    overlap_text = overlap_text[-overlap:]
-                current_chunk = overlap_text + ("\n\n" if overlap_text else "") + para
+                sentences.append(s)
                 
-    if current_chunk:
-        chunks.append(current_chunk)
+    chunks = []
+    i = 0
+    num_sentences = len(sentences)
+    
+    while i < num_sentences:
+        chunk_sentences = []
+        chunk_len = 0
+        j = i
+        
+        # Add sentences until we exceed the chunk size
+        while j < num_sentences:
+            s = sentences[j]
+            added_len = len(s) + (1 if chunk_len > 0 else 0)
+            if chunk_len + added_len <= chunk_size:
+                chunk_sentences.append(s)
+                chunk_len += added_len
+                j += 1
+            else:
+                break
+                
+        # Handle case where a sentence couldn't be added to a new chunk
+        if not chunk_sentences:
+            chunk_sentences.append(sentences[i])
+            j = i + 1
+            
+        chunks.append(" ".join(chunk_sentences))
+        
+        if j == num_sentences:
+            break
+            
+        # Determine the start of the next chunk with sentence-aligned overlap
+        next_start = j
+        overlap_len = 0
+        k = j - 1
+        
+        while k >= i:
+            s = sentences[k]
+            added_overlap = len(s) + (1 if overlap_len > 0 else 0)
+            if overlap_len + added_overlap <= overlap:
+                overlap_len += added_overlap
+                next_start = k
+                k -= 1
+            else:
+                break
+                
+        # Ensure forward progress
+        if next_start == j:
+            next_start = j
+            
+        i = next_start
         
     return chunks
 
@@ -68,10 +105,11 @@ def generate_embeddings_batch(client: genai.Client, texts: list[str]) -> list[li
     base_delay = 10.0
     for attempt in range(max_retries):
         try:
-            # gemini-embedding-001 or text-embedding-004
+            # gemini-embedding-2 with configured output dimension
             response = client.models.embed_content(
                 model=EMBEDDING_MODEL,
-                contents=texts
+                contents=[[t] for t in texts],
+                config={'output_dimensionality': EMBEDDING_DIMENSION}
             )
             
             # Parse the embeddings
@@ -118,6 +156,7 @@ def create_embeddings_for_all_essays(force_rebuild: bool = False):
             cursor.execute("DELETE FROM chunks;")
             if VEC_EXTENSION_AVAILABLE:
                 cursor.execute("DELETE FROM vec_chunks;")
+            cursor.execute("DELETE FROM fts_chunks;")
             conn.commit()
             embedded_essay_ids = set()
         else:
@@ -150,6 +189,7 @@ def create_embeddings_for_all_essays(force_rebuild: bool = False):
                 cursor.execute(f"DELETE FROM chunks WHERE essay_id IN ({placeholder});", tuple(partially_embedded_ids))
                 if VEC_EXTENSION_AVAILABLE:
                     cursor.execute("DELETE FROM vec_chunks WHERE rowid NOT IN (SELECT id FROM chunks);")
+                cursor.execute("DELETE FROM fts_chunks WHERE rowid NOT IN (SELECT id FROM chunks);")
                 conn.commit()
                 logger.info(f"Cleared partial database chunks for {len(partially_embedded_ids)} essays.")
                 
@@ -220,14 +260,21 @@ def create_embeddings_for_all_essays(force_rebuild: bool = False):
                 VALUES (?, ?, ?, ?, ?, ?);
                 """, (item["essay_id"], item["chunk_index"], item["content"], item["char_count"], item["word_count"], embedding_blob))
                 
+                chunk_id = cursor.lastrowid
+                
                 # If sqlite-vec is available, also load it into the virtual matching table
                 if VEC_EXTENSION_AVAILABLE:
-                    chunk_id = cursor.lastrowid
                     embedding_json = json.dumps(embedding)
                     cursor.execute("""
                     INSERT INTO vec_chunks (rowid, embedding)
                     VALUES (?, ?);
                     """, (chunk_id, embedding_json))
+                    
+                # Insert chunk into FTS5 text table for hybrid search
+                cursor.execute("""
+                INSERT INTO fts_chunks (rowid, chunk_id, content)
+                VALUES (?, ?, ?);
+                """, (chunk_id, chunk_id, item["content"]))
                 
             conn.commit()
             chunks_inserted += len(batch)

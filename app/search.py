@@ -1,51 +1,85 @@
+import re
 import json
 import logging
 from google import genai
 from google.genai import types
-from app.config import EMBEDDING_MODEL, LLM_MODEL, get_api_key
+from app.config import EMBEDDING_MODEL, EMBEDDING_DIMENSION, LLM_MODEL, get_api_key
 from app.database import get_db_connection
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("search")
 
-def improve_query(client: genai.Client, raw_query: str) -> str:
-    """Uses gemini-2.5-flash to rewrite and expand the query with terms 
-    characteristic of Paul Graham's essays to maximize vector matching.
+def clean_fts_query(query: str) -> str:
+    """Cleans a query string to make it safe for SQLite FTS5 MATCH syntax,
+    preventing syntax error crashes from arbitrary user inputs or punctuation.
     """
-    prompt = f"""You are an AI assistant designed to optimize search queries for a vector database of Paul Graham's essays.
-Your task is to analyze the user's question, clarify their intent, and produce a list of search keywords, phrases, and concepts that are highly characteristic of Paul Graham's writing style and vocabulary.
+    # Keep alphanumeric characters and whitespace, remove punctuation
+    cleaned = re.sub(r'[^\w\s]', ' ', query)
+    words = cleaned.strip().split()
+    # Double-quote each word for FTS5 syntax safety, joining them with OR
+    safe_words = [f'"{w}"' for w in words if w]
+    return " OR ".join(safe_words)
 
+def route_and_expand_query(client: genai.Client, query: str) -> dict:
+    """Classifies user intent and generates an improved query in a single-pass JSON-structured
+    LLM roundtrip to shave off latency.
+    
+    Returns a dict with:
+    - 'category': one of 'greeting', 'essay_query', or 'out_of_scope'
+    - 'reason': brief 1-sentence reason
+    - 'improved_query': rewritten query (meaningful if category is 'essay_query')
+    """
+    prompt = f"""Analyze the user's input to classify its intent AND generate a search-optimized query for a vector and full-text database of Paul Graham's essays.
+
+Categories:
+1. "greeting": Conversational greetings, introductions, or generic chit-chat (e.g., "hello", "hi", "hey", "who are you", "what is your name", "how's it going").
+2. "essay_query": Explicit or implicit questions about startups, essay topics, entrepreneurship, technology, programming, career, hacking, writing, doing great work, or Paul Graham himself.
+3. "out_of_scope": Specific factual or analytical questions completely unrelated to Paul Graham's writings, startups, or essays (e.g., "What is the capital of France?", "Write a python script to reverse a list", "How do I bake chocolate chip cookies?").
+
+For "essay_query", you must also generate a search-optimized rewrite.
 Paul Graham frequently writes about topics like:
 - "doing things that don't scale", "making something people want", "ramen profitable"
 - "the cofounder relationship", "organic growth", "giving startup ideas"
-- "hacker culture", "lisp", "wealth creation", "writing online"
+- "hacker culture", "lisp", "wealth creation", "writing online", "doing great work"
 
-User Question: "{raw_query}"
+The improved query should be a plain-text paragraph or a combined string that blends the user's original intent with these style-specific concepts and keywords to maximize lexical and semantic retrieval similarity. Do not use markdown or bullet points.
 
-Provide a single, search-optimized search query. The output should be a plain-text paragraph or a combined string that blends the user's original intent with these style-specific concepts to maximize retrieval similarity. Do not use any markdown tags, bullet points, introduction, or formatting. Output only the search-optimized query string.
+User input: "{query}"
+
+You MUST respond with a JSON object containing three fields:
+- "category": "greeting", "essay_query", or "out_of_scope"
+- "reason": "A brief explanation of the classification."
+- "improved_query": "The rewritten, search-optimized query string, or null if the category is greeting/out_of_scope."
 """
     try:
         response = client.models.generate_content(
             model=LLM_MODEL,
-            contents=prompt
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
         )
-        improved = response.text.strip()
-        logger.info(f"Raw query: '{raw_query}' -> Improved query: '{improved}'")
-        return improved
+        data = json.loads(response.text.strip())
+        logger.info(f"Route and expand query for '{query}': {data}")
+        return data
     except Exception as e:
-        logger.warning(f"Failed to improve query (using raw instead): {e}")
-        return raw_query
+        logger.warning(f"Failed to route and expand query '{query}' (defaulting to essay_query): {e}")
+        return {
+            "category": "essay_query",
+            "reason": str(e),
+            "improved_query": query
+        }
 
 def search_vector_chunks(client: genai.Client, query: str, limit: int = 6) -> list[dict]:
-    """Generates embedding for the query and retrieves the closest chunks.
-    Uses sqlite-vec MATCH virtual table search if available, otherwise executes
-    a pure-Python dot-product scan over all chunks in the database.
+    """Generates embedding for the query, retrieves candidates using native vector/fallback search
+    and SQLite FTS5 lexical search, then merges them using Reciprocal Rank Fusion (RRF).
     """
     # 1. Generate query embedding
     try:
         emb_response = client.models.embed_content(
             model=EMBEDDING_MODEL,
-            contents=query
+            contents=query,
+            config={'output_dimensionality': EMBEDDING_DIMENSION}
         )
         query_vector = emb_response.embeddings[0].values
     except Exception as e:
@@ -54,86 +88,143 @@ def search_vector_chunks(client: genai.Client, query: str, limit: int = 6) -> li
         
     from app.database import VEC_EXTENSION_AVAILABLE, get_db_connection, deserialize_vector
     
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # 2. Dense Vector Search (semantic, top 20 candidates)
+    vector_results = []
     if VEC_EXTENSION_AVAILABLE:
-        logger.info("Using native sqlite-vec extension for MATCH vector search.")
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        query_vector_json = json.dumps(query_vector)
-        
-        cursor.execute("""
-            SELECT 
-                c.id as chunk_id,
-                c.content as content,
-                c.chunk_index as chunk_index,
-                e.title as essay_title,
-                e.url as essay_url,
-                v.distance as distance
-            FROM vec_chunks v
-            JOIN chunks c ON v.rowid = c.id
-            JOIN essays e ON c.essay_id = e.id
-            WHERE v.embedding MATCH ?
-            ORDER BY v.distance
-            LIMIT ?;
-        """, (query_vector_json, limit))
-        
-        rows = cursor.fetchall()
-        conn.close()
-        
-        results = []
-        for r in rows:
-            results.append({
-                "chunk_id": r["chunk_id"],
-                "content": r["content"],
-                "chunk_index": r["chunk_index"],
-                "essay_title": r["essay_title"],
-                "essay_url": r["essay_url"],
-                "distance": r["distance"]
-            })
-        return results
-    else:
-        logger.info("sqlite-vec not loaded. Executing fallback pure-Python dot-product vector scan.")
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Pull all chunks with their serialized vectors
-        cursor.execute("""
-            SELECT 
-                c.id as chunk_id,
-                c.content as content,
-                c.chunk_index as chunk_index,
-                c.embedding as embedding_blob,
-                e.title as essay_title,
-                e.url as essay_url
-            FROM chunks c
-            JOIN essays e ON c.essay_id = e.id;
-        """)
-        
-        rows = cursor.fetchall()
-        conn.close()
-        
-        candidates = []
-        for r in rows:
-            # Deserialize raw float bytes back to floats
-            chunk_vector = deserialize_vector(r["embedding_blob"])
+        try:
+            logger.info("Using native sqlite-vec extension for MATCH vector search (top 20).")
+            query_vector_json = json.dumps(query_vector)
+            cursor.execute("""
+                SELECT 
+                    c.id as chunk_id,
+                    c.content as content,
+                    c.chunk_index as chunk_index,
+                    e.title as essay_title,
+                    e.url as essay_url,
+                    v.distance as distance
+                FROM vec_chunks v
+                JOIN chunks c ON v.rowid = c.id
+                JOIN essays e ON c.essay_id = e.id
+                WHERE v.embedding MATCH ?
+                ORDER BY v.distance ASC
+                LIMIT ?;
+            """, (query_vector_json, 20))
+            for r in cursor.fetchall():
+                vector_results.append({
+                    "chunk_id": r["chunk_id"],
+                    "content": r["content"],
+                    "chunk_index": r["chunk_index"],
+                    "essay_title": r["essay_title"],
+                    "essay_url": r["essay_url"],
+                    "distance": r["distance"]
+                })
+        except Exception as e:
+            logger.error(f"sqlite-vec MATCH query failed: {e}")
+    
+    # Fallback to pure-Python vector search if vector_results is empty
+    if not vector_results:
+        logger.info("sqlite-vec not loaded or failed. Executing fallback pure-Python dot-product vector scan (top 20).")
+        try:
+            cursor.execute("""
+                SELECT 
+                    c.id as chunk_id,
+                    c.content as content,
+                    c.chunk_index as chunk_index,
+                    c.embedding as embedding_blob,
+                    e.title as essay_title,
+                    e.url as essay_url
+                FROM chunks c
+                JOIN essays e ON c.essay_id = e.id;
+            """)
+            all_chunks = cursor.fetchall()
             
-            # Compute dot product (since vectors from Gemini are normalized, this equals cosine similarity)
-            similarity = sum(x * y for x, y in zip(chunk_vector, query_vector))
+            candidates = []
+            for r in all_chunks:
+                chunk_vector = deserialize_vector(r["embedding_blob"])
+                similarity = sum(x * y for x, y in zip(chunk_vector, query_vector))
+                distance = 1.0 - similarity
+                candidates.append({
+                    "chunk_id": r["chunk_id"],
+                    "content": r["content"],
+                    "chunk_index": r["chunk_index"],
+                    "essay_title": r["essay_title"],
+                    "essay_url": r["essay_url"],
+                    "distance": distance
+                })
+            candidates.sort(key=lambda x: x["distance"])
+            vector_results = candidates[:20]
+        except Exception as e:
+            logger.error(f"Fallback vector scan failed: {e}")
             
-            # Convert similarity to distance format (smaller distance is a better match)
-            distance = 1.0 - similarity
+    # 3. FTS5 Lexical Search (top 20 candidates)
+    fts_results = []
+    cleaned_query = clean_fts_query(query)
+    if cleaned_query:
+        logger.info(f"Using SQLite FTS5 for lexical search (top 20) with query: {cleaned_query}")
+        try:
+            cursor.execute("""
+                SELECT 
+                    c.id as chunk_id,
+                    c.content as content,
+                    c.chunk_index as chunk_index,
+                    e.title as essay_title,
+                    e.url as essay_url,
+                    bm25(fts_chunks) as score
+                FROM fts_chunks f
+                JOIN chunks c ON f.rowid = c.id
+                JOIN essays e ON c.essay_id = e.id
+                WHERE fts_chunks MATCH ?
+                ORDER BY score ASC
+                LIMIT ?;
+            """, (cleaned_query, 20))
+            for r in cursor.fetchall():
+                fts_results.append({
+                    "chunk_id": r["chunk_id"],
+                    "content": r["content"],
+                    "chunk_index": r["chunk_index"],
+                    "essay_title": r["essay_title"],
+                    "essay_url": r["essay_url"],
+                    "score": r["score"]
+                })
+        except Exception as e:
+            logger.warning(f"FTS5 MATCH failed: {e}")
             
-            candidates.append({
-                "chunk_id": r["chunk_id"],
-                "content": r["content"],
-                "chunk_index": r["chunk_index"],
-                "essay_title": r["essay_title"],
-                "essay_url": r["essay_url"],
-                "distance": distance
-            })
-            
-        # Sort ascending by distance (closest matches first)
-        candidates.sort(key=lambda x: x["distance"])
-        return candidates[:limit]
+    conn.close()
+    
+    # 4. Merge candidates using Reciprocal Rank Fusion (RRF)
+    rrf_scores = {}
+    chunk_details = {}
+    
+    # Process vector results
+    for rank_idx, doc in enumerate(vector_results):
+        rank = rank_idx + 1
+        doc_id = doc["chunk_id"]
+        rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + (1.0 / (60.0 + rank))
+        chunk_details[doc_id] = doc
+        
+    # Process FTS5 results
+    for rank_idx, doc in enumerate(fts_results):
+        rank = rank_idx + 1
+        doc_id = doc["chunk_id"]
+        rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + (1.0 / (60.0 + rank))
+        chunk_details[doc_id] = doc
+        
+    # Sort candidates by combined RRF score descending
+    sorted_doc_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
+    
+    # Retrieve top candidates up to limit
+    fused_results = []
+    for doc_id in sorted_doc_ids[:limit]:
+        doc = chunk_details[doc_id]
+        doc.pop("distance", None)
+        doc.pop("score", None)
+        fused_results.append(doc)
+        
+    logger.info(f"RRF Hybrid Search merged {len(vector_results)} dense and {len(fts_results)} lexical chunks into {len(fused_results)} final results.")
+    return fused_results
 
 def generate_rag_answer(client: genai.Client, raw_query: str, chunks: list[dict]) -> dict:
     """Takes the retrieved chunks and synthesizes a comprehensive response strictly grounded in them."""
@@ -181,14 +272,11 @@ Answer:
         answer = response.text.strip()
         
         # Determine unique cited sources
-        # We parse the text to see which citations [1], [2], etc. were actually used
         cited_sources = []
         for idx in sources_map:
             citation_str = f"[{idx}]"
             if citation_str in answer:
-                # Add citation details
                 item = sources_map[idx]
-                # Avoid duplicates in final list
                 if item not in cited_sources:
                     cited_sources.append(item)
                     
@@ -204,40 +292,6 @@ Answer:
     except Exception as e:
         logger.error(f"Error during RAG generation: {e}")
         raise e
-
-def classify_query(client: genai.Client, query: str) -> dict:
-    """Classifies the user query into one of three categories:
-    - 'greeting': conversational greetings (e.g. hello, hi, hey, how are you, who are you)
-    - 'essay_query': questions related to startup ideas, doing great work, Paul Graham, tech, essays, etc.
-    - 'out_of_scope': queries completely unrelated to Paul Graham's topics or writing (e.g. capital of France, math, general coding, recipe)
-    
-    Returns a dict with 'category' and 'reason'.
-    """
-    prompt = f"""Analyze the user's input and classify it into one of these three categories:
-1. "greeting": Conversational greetings, introductions, or generic chit-chat (e.g., "hello", "hi", "hey", "who are you", "what is your name", "how's it going").
-2. "essay_query": Explicit or implicit questions about startups, essay topics, entrepreneurship, technology, programming, career, hacking, writing, doing great work, or Paul Graham himself.
-3. "out_of_scope": Specific factual or analytical questions completely unrelated to Paul Graham's writings, startups, or essays (e.g., "What is the capital of France?", "Write a python script to reverse a list", "How do I bake chocolate chip cookies?").
-
-User input: "{query}"
-
-You MUST respond with a JSON object containing two fields:
-- "category": one of "greeting", "essay_query", or "out_of_scope"
-- "reason": a brief 1-sentence explanation of why it was classified this way.
-"""
-    try:
-        response = client.models.generate_content(
-            model=LLM_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            )
-        )
-        data = json.loads(response.text.strip())
-        logger.info(f"Query classification for '{query}': {data}")
-        return data
-    except Exception as e:
-        logger.warning(f"Failed to classify query '{query}' (defaulting to 'essay_query'): {e}")
-        return {"category": "essay_query", "reason": str(e)}
 
 def generate_greeting_response(client: genai.Client, raw_query: str) -> str:
     """Generates a warm, professional, premium greeting introducing the Paul Graham Essay Assistant."""
@@ -286,9 +340,10 @@ def ask_chatbot(raw_query: str) -> dict:
     api_key = get_api_key()
     client = genai.Client(api_key=api_key)
     
-    # 1. Classify query intent to route or filter
-    classification = classify_query(client, raw_query)
-    category = classification.get("category", "essay_query")
+    # 1. Single-pass query routing and expansion
+    routing_data = route_and_expand_query(client, raw_query)
+    category = routing_data.get("category", "essay_query")
+    improved = routing_data.get("improved_query") or raw_query
     
     if category == "greeting":
         answer = generate_greeting_response(client, raw_query)
@@ -306,16 +361,11 @@ def ask_chatbot(raw_query: str) -> dict:
             "improved_query": "[Bypassed Search - Out of Scope]"
         }
     
-    # 3. Standard RAG flow for essay_query
-    # Expand query to match PG's narrative terminology
-    improved = improve_query(client, raw_query)
-    
-    # Perform vector search in SQLite using sqlite-vec
+    # 2. Hybrid search (Dense vector + FTS5) with RRF
     retrieved_chunks = search_vector_chunks(client, improved)
     
-    # Generate answer grounded in the sources
+    # 3. Grounded generation
     rag_response = generate_rag_answer(client, raw_query, retrieved_chunks)
-    
-    # Add improved query to response for UI visualization
     rag_response["improved_query"] = improved
+    
     return rag_response

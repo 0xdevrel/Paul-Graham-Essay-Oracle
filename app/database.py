@@ -39,11 +39,28 @@ def get_db_connection():
     return conn
 
 def init_db():
-    """Initializes database tables. Creates sqlite-vec virtual tables if supported,
-    otherwise relies on standard tables with binary vector storage.
+    """Initializes database tables. Creates sqlite-vec and FTS5 virtual tables if supported,
+    otherwise relies on standard tables with binary vector storage. Resets tables automatically
+    on vector dimension changes to prevent query crashes.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
+    
+    # Check for dimension mismatch in existing data to execute automatic table reset
+    try:
+        cursor.execute("SELECT embedding FROM chunks LIMIT 1;")
+        row = cursor.fetchone()
+        if row:
+            existing_vector = deserialize_vector(row["embedding"])
+            if len(existing_vector) != EMBEDDING_DIMENSION:
+                logger.warning(f"Dimension mismatch detected in database ({len(existing_vector)} vs expected {EMBEDDING_DIMENSION}). Resetting chunks, vector, and FTS tables...")
+                cursor.execute("DROP TABLE IF EXISTS chunks;")
+                cursor.execute("DROP TABLE IF EXISTS vec_chunks;")
+                cursor.execute("DROP TABLE IF EXISTS fts_chunks;")
+                conn.commit()
+    except sqlite3.OperationalError:
+        # Table chunks does not exist yet; normal behavior on initial boot
+        pass
     
     # 1. Essays Table (Raw content and metadata)
     cursor.execute("""
@@ -82,6 +99,14 @@ def init_db():
         """)
     else:
         logger.warning("sqlite-vec extension is not supported in this environment. Falling back to high-performance pure-Python vector scan.")
+        
+    # 4. FTS5 Text Table (Full-Text Search)
+    cursor.execute("""
+    CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
+        chunk_id UNINDEXED,
+        content
+    );
+    """)
     
     # 4. Ingestion Status Tracking
     cursor.execute("""
