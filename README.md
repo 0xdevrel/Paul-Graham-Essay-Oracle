@@ -115,3 +115,9 @@ python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 3. Click the **Index Essays** button. A progress bar will appear to update you on scraping and vector embedding generation.
 4. Once the progress hits 100% and status changes to "Engine Online", the chat box will unlock automatically.
 5. Chat seamlessly using the interactive typing bar or sample query chips!
+
+---
+
+## License
+
+This project is open-source and available under the terms of the MIT License. See the LICENSE file for details.
